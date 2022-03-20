@@ -1,7 +1,6 @@
+import math
 from io import BytesIO
 from typing import List, Optional, Union, Dict, Any
-
-import math
 
 from .unspent import Unspent
 from ..constants import SIGHASH, Chain
@@ -9,11 +8,10 @@ from ..constants import TRANSACTION_VERSION, TRANSACTION_LOCKTIME, TRANSACTION_S
 from ..hash import hash256
 from ..keys import PrivateKey
 from ..script.script import Script
-from ..script.type import ScriptType, P2pkhScriptType, OpReturnScriptType
+from ..script.type import ScriptType, P2pkhScriptType, OpReturnScriptType, UnknownScriptType
 from ..service.provider import Provider
 from ..service.service import Service
-from ..service.whatsonchain import WhatsOnChain
-from ..utils import unsigned_to_varint, serialize_ecdsa_der
+from ..utils import unsigned_to_varint
 
 
 class InsufficientFunds(ValueError):
@@ -28,7 +26,7 @@ class TxInput:
         self.vout: int = unspent.vout
         self.satoshi: int = unspent.satoshi
         self.height: int = unspent.height
-        self.confirmation: int = unspent.confirmation
+        self.confirmations: int = unspent.confirmations
         self.private_keys: List[PrivateKey] = private_keys or unspent.private_keys or []
         self.script_type: ScriptType = unspent.script_type
         self.locking_script: Script = unspent.locking_script
@@ -46,13 +44,13 @@ class TxInput:
         stream.write(self.sequence.to_bytes(4, 'little'))
         return stream.getvalue()
 
-    def __repr__(self) -> str:  # pragma: no cover
+    def __str__(self) -> str:  # pragma: no cover
         return f'<TxInput outpoint={self.txid}:{self.vout} satoshi={self.satoshi} locking_script={self.locking_script}>'
 
 
 class TxOutput:
 
-    def __init__(self, out: Union[str, List[Union[str, bytes]], Script], satoshi: int = 0, script_type: Optional[ScriptType] = None):
+    def __init__(self, out: Union[str, List[Union[str, bytes]], Script], satoshi: int = 0, script_type: ScriptType = UnknownScriptType):
         self.satoshi = satoshi
         if isinstance(out, str):
             # from address
@@ -72,6 +70,9 @@ class TxOutput:
     def serialize(self) -> bytes:
         return self.satoshi.to_bytes(8, 'little') + self.locking_script.byte_length_varint() + self.locking_script.serialize()
 
+    def __str__(self) -> str:  # pragma: no cover
+        return f'<TxOutput satoshi={self.satoshi} locking_script={self.locking_script.hex()}>'
+
 
 class Transaction:
 
@@ -84,7 +85,7 @@ class Transaction:
         self.locktime: int = locktime
         self.fee_rate: float = fee_rate if fee_rate is not None else TRANSACTION_FEE_RATE
         self.chain: Chain = chain
-        self.provider: Provider = provider or WhatsOnChain(chain)
+        self.provider: Provider = provider
         self.kwargs: Dict[str, Any] = dict(**kwargs) or {}
 
     def serialize(self) -> bytes:
@@ -218,9 +219,9 @@ class Transaction:
         for i in range(len(self.tx_inputs)):
             tx_input = self.tx_inputs[i]
             if not tx_input.unlocking_script or not bypass:
-                signatures: List[bytes] = [serialize_ecdsa_der(private_key.sign(digests[i])) for private_key in tx_input.private_keys]
+                signatures: List[bytes] = [private_key.sign(digests[i]) for private_key in tx_input.private_keys]
                 payload = {'signatures': signatures, 'private_keys': tx_input.private_keys, 'sighash': tx_input.sighash}
-                tx_input.unlocking_script = tx_input.script_type.unlocking(**payload, **self.kwargs, **kwargs)
+                tx_input.unlocking_script = tx_input.script_type.unlocking(**payload, **{**self.kwargs, **kwargs})
         return self
 
     def satoshi_total_in(self) -> int:
@@ -251,7 +252,7 @@ class Transaction:
         for tx_input in self.tx_inputs:
             if not tx_input.private_keys:
                 raise ValueError(f"can't estimate byte length for {tx_input} without private keys")
-            estimated_length += 41 + tx_input.script_type.estimated_unlocking_byte_length(private_keys=tx_input.private_keys, **self.kwargs, **kwargs)
+            estimated_length += 41 + tx_input.script_type.estimated_unlocking_byte_length(private_keys=tx_input.private_keys, **{**self.kwargs, **kwargs})
         for tx_output in self.tx_outputs:
             estimated_length += 8 + len(tx_output.locking_script.byte_length_varint()) + tx_output.locking_script.byte_length()
         return estimated_length
@@ -284,6 +285,7 @@ class Transaction:
         return self
 
     def broadcast(self) -> Optional[str]:  # pragma: no cover
-        if self.fee() < self.estimated_fee():
-            raise InsufficientFunds(f'require {self.estimated_fee() + self.satoshi_total_out()} satoshi but only {self.satoshi_total_in()}')
+        fee_expected = math.ceil(self.fee_rate * self.byte_length())
+        if self.fee() < fee_expected:
+            raise InsufficientFunds(f'require {self.satoshi_total_out() + fee_expected} satoshi but only {self.satoshi_total_in()}')
         return Service(self.chain, self.provider).broadcast(self.hex())

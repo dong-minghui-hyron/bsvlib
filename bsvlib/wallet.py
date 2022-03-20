@@ -51,17 +51,21 @@ class Wallet:
     def get_unspents(self, refresh: bool = False, **kwargs) -> List[Unspent]:
         if refresh:
             self.unspents = []
+            chain: Chain = kwargs.pop('chain', None) or self.chain
+            provider: Provider = kwargs.pop('provider', None) or self.provider
             with ThreadPoolExecutor(max_workers=THREAD_POOL_MAX_EXECUTORS) as executor:
-                args = [dict(private_keys=[key], **self.kwargs, **kwargs) for key in self.keys]
-                for r in executor.map(get_unspents_wrapper, repeat(self.chain), repeat(self.provider), args):
+                args = [dict(private_keys=[key], **{**self.kwargs, **kwargs}) for key in self.keys]
+                for r in executor.map(get_unspents_wrapper, repeat(chain), repeat(provider), args):
                     self.unspents.extend(r)
         return self.unspents
 
     def get_balance(self, refresh: bool = False, **kwargs) -> int:
         if refresh:
+            chain: Chain = kwargs.pop('chain', None) or self.chain
+            provider: Provider = kwargs.pop('provider', None) or self.provider
             with ThreadPoolExecutor(max_workers=THREAD_POOL_MAX_EXECUTORS) as executor:
-                args = [dict(private_keys=[key], **self.kwargs, **kwargs) for key in self.keys]
-                return sum([r for r in executor.map(get_balance_wrapper, repeat(self.chain), repeat(self.provider), args)])
+                args = [dict(private_keys=[key], **{**self.kwargs, **kwargs}) for key in self.keys]
+                return sum([r for r in executor.map(get_balance_wrapper, repeat(chain), repeat(provider), args)])
         return sum([unspent.satoshi for unspent in self.unspents])
 
     def create_transaction(self, outputs: Optional[List[Tuple]] = None, leftover: Optional[str] = None,
@@ -77,38 +81,40 @@ class Wallet:
         :param pushdatas: list of OP_RETURN pushdata
         :param change: automatically add a P2PKH change output if True
         :param sign: sign the transaction if True
-        :param kwargs: passing to get unspents and sign
+        :param kwargs: passing to get unspents and create transaction
         """
-        self.unspents = unspents or self.get_unspents(refresh=True, **self.kwargs, **kwargs)
-        if not self.unspents:
+        unspents: List[Unspent] = unspents or self.get_unspents(refresh=True, **{**self.kwargs, **kwargs})
+        if not unspents:
             raise InsufficientFunds('transaction mush have at least one unspent')
 
-        t = Transaction(fee_rate=fee_rate, chain=self.chain, provider=self.provider)
+        t = Transaction(fee_rate=fee_rate, chain=self.chain, provider=self.provider, **{**self.kwargs, **kwargs})
         if pushdatas:
             t.add_output(TxOutput(pushdatas))
         if outputs:
             t.add_outputs([TxOutput(output[0], output[1]) for output in outputs])
         # pick unspent
-        picked_unspents = []
+        picked_unspents: List[Unspent] = []
         if combine or not outputs:
-            picked_unspents = self.unspents
-            self.unspents = []
+            picked_unspents = unspents
+            unspents = []
             t.add_inputs([unspent for unspent in picked_unspents])
         else:
-            unspent = self.unspents.pop(0)
+            unspent = unspents.pop()
             picked_unspents.append(unspent)
             t.add_input(unspent)
-            while t.fee() < t.estimated_fee() and self.unspents:
-                unspent = self.unspents.pop(0)
+            while t.fee() < t.estimated_fee() and unspents:
+                unspent = unspents.pop()
                 picked_unspents.append(unspent)
                 t.add_input(unspent)
         if t.fee() < t.estimated_fee():
-            self.unspents.extend(picked_unspents)
+            unspents.extend(picked_unspents)
             raise InsufficientFunds(f'require {t.estimated_fee() + t.satoshi_total_out()} satoshi but only {t.satoshi_total_in()}')
+        else:
+            self.unspents = list(set(self.unspents) - set(picked_unspents))
         if change:
             t.add_change(leftover)
         if sign:
-            t.sign(**self.kwargs, **kwargs)
+            t.sign()
         return t
 
     def send_transaction(self, outputs: Optional[List[Tuple]] = None, leftover: Optional[str] = None,
